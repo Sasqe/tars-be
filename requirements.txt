@@ -1,0 +1,12 @@
+numpy>=1.26.0,<2.1.0       # For data manipulation
+pandas==2.2.3        # For dataset handling (if necessary)
+matplotlib==3.9.0    # For visualizing data and model performance
+opencv-python==4.10.0.84 # For image pre-processing (optional)
+fastapi==0.115.6      # For serving the model as an API
+uvicorn[standard]==0.22.0 # For running FastAPI
+scikit-learn
+python-multipart
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch
+torchvision
+torchaudio
