@@ -8,8 +8,18 @@ import os
 from scipy.ndimage import center_of_mass
 from net import Net
 from harness import Harness
+from fastapi.middleware.cors import CORSMiddleware
+
 # Initialize FastAPI app
 app = FastAPI()
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins; restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all HTTP methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 # Load the trained model
 MODEL_PATH = "best_model.pth"
