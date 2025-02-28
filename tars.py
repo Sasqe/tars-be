@@ -1,5 +1,6 @@
 import math
 import torch
+from torchinfo import summary
 from fastapi import FastAPI, File, UploadFile, WebSocket
 import numpy as np
 import cv2
@@ -30,114 +31,98 @@ model = Net().to(device)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval()
 
+print(summary(model, input_size=(1, 1, 28, 28), col_names=["input_size", "output_size", "num_params"]))
+
+
 # Harness model
 harness = Harness()
 harness.hook(model)
 
-def adjust_thickness(img, target_thickness=67):
-    """
-    Adjust the thickness of the digit lines in the image.
 
-    Parameters:
-    - img: Binary image (0 and 255 values) of the digit.
-    - target_thickness: The desired stroke thickness (in pixels).
-
-    Returns:
-    - Adjusted binary image with the desired stroke thickness.
-    """
-    # Kernel for morphological operations
-    kernel = np.ones((2, 2), np.uint8)
-
-    # Measure current stroke thickness (approximation)
-    contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        max_contour = max(contours, key=cv2.contourArea)
-        bounding_box = cv2.boundingRect(max_contour)
-        current_thickness = max(bounding_box[2], bounding_box[3]) // 20  # Approximation
-
-        # Adjust thickness
-        if current_thickness < target_thickness:  # Too thin, dilate
-            img = cv2.dilate(img, kernel, iterations=1)
-        elif current_thickness > target_thickness:  # Too thick, erode
-            img = cv2.erode(img, kernel, iterations=1)
-
-    return img
-
-# Helper function to preprocess the image
 def preprocess_image(image_path):
-    # Read image in grayscale
-    gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    """Preprocess the image while preserving the digit's structure as closely as possible to MNIST format."""
 
+    # 1. Read in grayscale
+    gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if gray is None:
         raise ValueError("Failed to load the image. Ensure it is a valid image file.")
 
-    # Invert colors if needed (ensure black background with white digit)
-    gray = cv2.bitwise_not(gray) if np.mean(gray) > 127 else gray
+    # Debug: Save raw input
+    raw_image_path = "debug_raw_image.png"
+    cv2.imwrite(raw_image_path, gray)
+    print(f"Raw input image saved at: {raw_image_path}")
 
-    # Threshold the image (binarization)
-    _, gray = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    # 2. Detect if background is white or black by looking at the average pixel.
+    #    If mean is > 127, we assume a white background and invert to get white digit on black.
+    if np.mean(gray) > 127:
+        gray = cv2.bitwise_not(gray)
 
-    # Ensure the image is not empty after thresholding
-    if np.sum(gray) == 0:
-        raise ValueError("The image is completely empty after thresholding. Please check the input.")
+    # 3. Optional slight blur to reduce noise while leaving strokes relatively intact.
+    #    You can disable this if it hurts your accuracy.
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    # Adjust line thickness
-    gray = adjust_thickness(gray, 67)
+    # 4. Use Otsu’s threshold to robustly binarize without losing thin strokes.
+    #    (You can also try cv2.adaptiveThreshold if Otsu is too aggressive.)
+    _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
-    # Trim black borders
-    while np.sum(gray[0]) == 0 and gray.shape[0] > 1:
-        gray = gray[1:]
-    while np.sum(gray[:, 0]) == 0 and gray.shape[1] > 1:
-        gray = np.delete(gray, 0, axis=1)
-    while np.sum(gray[-1]) == 0 and gray.shape[0] > 1:
-        gray = gray[:-1]
-    while np.sum(gray[:, -1]) == 0 and gray.shape[1] > 1:
-        gray = np.delete(gray, -1, axis=1)
+    # 5. (Optional) If your strokes are very thin/faint, you can apply a small dilation:
+    # kernel = np.ones((2, 2), np.uint8)
+    # gray = cv2.dilate(gray, kernel, iterations=1)
 
-    # Check if the image is empty
+    # 6. Safe crop: find the bounding box of nonzero pixels and pad slightly so we don't clip strokes.
+    def safe_crop(img):
+        coords = cv2.findNonZero(img)
+        if coords is not None:
+            x, y, w, h = cv2.boundingRect(coords)
+            pad = 4  # Increase or decrease if you find edges being chopped
+            x = max(0, x - pad)
+            y = max(0, y - pad)
+            w = min(img.shape[1] - x, w + pad * 2)
+            h = min(img.shape[0] - y, h + pad * 2)
+            img = img[y:y + h, x:x + w]
+        return img
+
+    gray = safe_crop(gray)
+
+    # Make sure we didn't end up with an empty crop
     if gray.shape[0] == 0 or gray.shape[1] == 0:
         raise ValueError("The uploaded image is empty or could not be processed.")
 
-    # Resize to fit in a 20x20 box
-    rows, cols = gray.shape
-    if rows > cols:
-        factor = 20.0 / rows
-        rows = 20
-        cols = max(1, int(round(cols * factor)))  # Ensure cols > 0
-        gray = cv2.resize(gray, (cols, rows))
+    # 7. Resize to a max dimension of 20 in whichever is larger (height or width) to mimic MNIST
+    h, w = gray.shape
+    # Keep aspect ratio:
+    if h > w:
+        new_h, new_w = 20, int(20 * (w / h))
     else:
-        factor = 20.0 / cols
-        cols = 20
-        rows = max(1, int(round(rows * factor)))  # Ensure rows > 0
-        gray = cv2.resize(gray, (cols, rows))
+        new_w, new_h = 20, int(20 * (h / w))
 
-    # Pad to 28x28
-    cols_padding = (int(math.ceil((28 - cols) / 2.0)), int(math.floor((28 - cols) / 2.0)))
-    rows_padding = (int(math.ceil((28 - rows) / 2.0)), int(math.floor((28 - rows) / 2.0)))
-    gray = np.pad(gray, (rows_padding, cols_padding), mode='constant', constant_values=0)
+    # Use nearest-neighbor so we don’t blur away thin strokes
+    gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
-    # Center the digit using the center of mass
-    if np.sum(gray) == 0:  # Check if the image is still completely black
-        raise ValueError("The image is completely empty or invalid after processing.")
+    # 8. Pad up to 28×28, centered
+    pad_h = (28 - new_h) // 2
+    pad_w = (28 - new_w) // 2
+    gray = np.pad(gray,
+                  ((pad_h, 28 - new_h - pad_h), (pad_w, 28 - new_w - pad_w)),
+                  mode='constant', constant_values=0)
 
+    # 9. (Optional) Recenter by shifting based on center of mass.
     cy, cx = center_of_mass(gray)
-    if np.isnan(cy) or np.isnan(cx):  # Check for NaN values
+    if np.isnan(cy) or np.isnan(cx):
         raise ValueError("Center of mass calculation resulted in NaN. Check the input image.")
 
     shift_x = int(np.round(28 / 2 - cx))
     shift_y = int(np.round(28 / 2 - cy))
-
-    # Shift the image
     M = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
-    gray = cv2.warpAffine(gray, M, (28, 28))
+    gray = cv2.warpAffine(gray, M, (28, 28), borderMode=cv2.BORDER_CONSTANT, borderValue=(0,))
 
-    # Normalize pixel values to range [0, 1]
+    # 10. Normalize to [-1, 1]
     gray = gray.astype("float32") / 255.0
     gray = (gray - 0.5) / 0.5
 
-    # Save the preprocessed image for debugging
-    debug_image_path = "debug_preprocessed_image.png"
-    cv2.imwrite(debug_image_path, ((gray * 0.5 + 0.5) * 255).astype("uint8"))  # Rescale to [0, 255] for saving
+    # Debug: Save final preprocessed image (converted back to [0..255])
+    debug_image_path = "debug_preprocessed_image_fixed.png"
+    cv2.imwrite(debug_image_path, ((gray * 0.5 + 0.5) * 255).astype("uint8"))
     print(f"Preprocessed image saved at: {debug_image_path}")
 
     return gray

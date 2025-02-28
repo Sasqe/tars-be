@@ -7,36 +7,34 @@ class Net(nn.Module):
         super(Net, self).__init__()
 
         self.model = nn.Sequential(
-            # First convolutional block
-            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+            # First conv block (reducing channels to 16)
+            nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(16),
+
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),  # Stride 2 downsampling
             nn.ReLU(),
             nn.BatchNorm2d(32),
 
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            # Second conv block
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(64),
-            nn.Dropout(0.25),
 
-            # Second convolutional block
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),  # Stride 2 downsampling
             nn.ReLU(),
-            nn.BatchNorm2d(128),
+            nn.BatchNorm2d(64),
 
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(128),
-            nn.Dropout(0.25),
-
-            # Flatten for fully connected layers
-            nn.Flatten(),
+            # Global Average Pooling (reduces parameters)
+            nn.AdaptiveAvgPool2d(1),
 
             # Fully connected layers
-            nn.Linear(128 * 7 * 7, 256),  # Output size after 2x max-pooling is 7x7
+            nn.Flatten(),
+            nn.Linear(64, 32),
             nn.ReLU(),
-            nn.BatchNorm1d(256),
-            nn.Dropout(0.5),
+            nn.Dropout(0.3),
 
-            nn.Linear(256, 10)  # Output layer for 10 classes (digits 0-9)
+            nn.Linear(32, 10)  # Output layer for 10 classes
         )
 
     def forward(self, x):
