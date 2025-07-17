@@ -1,6 +1,5 @@
 import math
 import torch
-from torchinfo import summary
 from fastapi import FastAPI, File, UploadFile, WebSocket
 import numpy as np
 import cv2
@@ -30,8 +29,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = Net().to(device)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval()
-
-print(summary(model, input_size=(1, 1, 28, 28), col_names=["input_size", "output_size", "num_params"]))
 
 
 # Harness model
