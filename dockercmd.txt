@@ -1,0 +1,15 @@
+build
+docker build -t tars-be:latest .
+
+run interactive with mount
+docker run --rm -it -p 8000:8000 ^
+  -v "C:\Users\Chris\PycharmProjects\tars-be:/app" ^
+  -w "/app" ^
+  df58cba28aff  ^
+  sh
+
+hit predict locally
+curl -X POST http://localhost:8000/predict ^
+  -H "accept: application/json" ^
+  -H "Content-Type: multipart/form-data" ^
+  -F "file=@8.png"

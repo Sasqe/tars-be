@@ -1,50 +1,51 @@
 import torch
 import torch.nn as nn
 
-
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-
+        # The model is defined as a sequential container of layers
         self.model = nn.Sequential(
-            # First conv block (reducing channels to 16)
-            nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(16),
-
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),  # Stride 2 downsampling
-            nn.ReLU(),
+            # First convolutional block
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
-
-            # Second conv block
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
+            # Downsampling conv block (with stride 2)
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),  # outputs 14x14
             nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
 
-            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),  # Stride 2 downsampling
-            nn.ReLU(),
+            # Second convolutional block
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            # Downsampling conv block (with stride 2)
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),  # outputs 7x7
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
 
-            # Global Average Pooling (reduces parameters)
+            # Global Average Pooling to reduce spatial dimensions to 1x1
             nn.AdaptiveAvgPool2d(1),
 
-            # Fully connected layers
             nn.Flatten(),
             nn.Linear(64, 32),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Dropout(0.3),
-
-            nn.Linear(32, 10)  # Output layer for 10 classes
+            nn.Linear(32, 10)
         )
+        # Note: Increased initial conv filters to 32 (from 16) and second conv to 64 (from 32)
+        # for richer feature maps. Kept final conv output at 64 channels to limit model size.
+        # Reordered layers to Conv -> BatchNorm -> ReLU for stability:contentReference[oaicite:8]{index=8}.
+        # Retained a dropout before the final layer to help prevent overfitting:contentReference[oaicite:9]{index=9}.
 
     def forward(self, x):
         return self.model(x)
 
-
-# Test the model
+# Test the model architecture
 if __name__ == "__main__":
     model = Net()
     print(model)
-    sample_input = torch.randn(1, 1, 28, 28)  # Batch size of 1, grayscale 28x28 image
+    sample_input = torch.randn(1, 1, 28, 28)
     output = model(sample_input)
-    print("Output shape:", output.shape)  # Should output [1, 10]
+    print("Output shape:", output.shape)  # Expected [1, 10]
+
