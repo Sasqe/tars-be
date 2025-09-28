@@ -26,4 +26,4 @@ EXPOSE 8000
 ENV NAME Tars
 
 # Command to run your application
-CMD ["uvicorn", "tars:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "tars.py"]

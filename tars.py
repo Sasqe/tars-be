@@ -1,16 +1,17 @@
 import torch
-from fastapi import FastAPI, File, UploadFile, WebSocket
-import numpy as np
-import cv2
+from fastapi import FastAPI, File, UploadFile, WebSocket, HTTPException, Header, Depends
 import uvicorn
-from scipy.ndimage import center_of_mass
 from net import Net
 from harness import Harness
 from fastapi.middleware.cors import CORSMiddleware
 import base64
+import cv2
+import numpy as np
 import os
+from dotenv import load_dotenv
 
-# Initialize FastAPI app
+load_dotenv()
+API_KEY = os.getenv("API_KEY")
 app = FastAPI()
 # Add CORS middleware
 app.add_middleware(
@@ -20,6 +21,9 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all HTTP methods
     allow_headers=["*"],  # Allows all headers
 )
+def verify_api_key(x_api_key: str = Header(None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 # Load the trained model
 MODEL_PATH = "best_model.pth"
@@ -43,12 +47,6 @@ def _file_to_data_url(path: str, mime: str = "image/png") -> str | None:
         return f"data:{mime};base64,{b64}"
     except FileNotFoundError:
         return None
-
-import cv2
-import numpy as np
-
-import cv2
-import numpy as np
 
 def preprocess_image(image_path: str) -> np.ndarray:
     """
@@ -180,15 +178,14 @@ def preprocess_image(image_path: str) -> np.ndarray:
 
 
 # Prediction endpoint
-@app.post("/predict")
+@app.post("/predict", dependencies=[Depends(verify_api_key)])
 async def predict_digit(file: UploadFile = File(...)):
     try:
-        # Save the uploaded file temporarily
+        TEMPERATURE = 2.5
         temp_file_path = "temp_uploaded_image.png"
         with open(temp_file_path, "wb") as temp_file:
             temp_file.write(await file.read())
 
-        # Preprocess the image
         preprocessed_image = preprocess_image(temp_file_path)
         preprocessed_image = np.expand_dims(preprocessed_image, axis=(0, 1))
 
@@ -203,10 +200,16 @@ async def predict_digit(file: UploadFile = File(...)):
                     "activation_shape": preprocessed_image.shape,
                     "activation_data": preprocessed_image.tolist()
                 })
-            output = model(preprocessed_image_tensor)
-            probabilities = torch.softmax(output, dim=1).cpu().numpy()[0]
+
+            logits = model(preprocessed_image_tensor)
+
+            # ---- Temperature scaling ----
+            scaled_logits = logits / TEMPERATURE
+            probabilities = torch.softmax(scaled_logits, dim=1).cpu().numpy()[0]
+
             predicted_digit = int(np.argmax(probabilities))
             confidence = float(np.max(probabilities))
+            # -----------------------------
 
         # Use harness to save activations
         harness.save_activations()
@@ -237,6 +240,10 @@ async def predict_digit(file: UploadFile = File(...)):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    api_key = websocket.query_params.get("api_key")
+    if api_key != API_KEY:
+        await websocket.close(code=1008)  # Policy Violation
+        return
     await websocket.accept()
     harness.websocket = websocket
     await websocket.send_text("WebSocket connected: ready to stream activations")
@@ -303,10 +310,9 @@ def grad_cam(model, input_tensor, target_class, target_layer_idx=0, save_path="g
     print(f"Grad-CAM heatmap saved to: {save_path}")
 
 # Health check endpoint
-@app.get("/")
+@app.get("/", dependencies=[Depends(verify_api_key)])
 def read_root():
     return {"message": "TARS API is running!"}
 
-# Run the app if this script is executed directly
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
