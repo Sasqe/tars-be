@@ -1,5 +1,8 @@
 import torch
 from fastapi import WebSocket
+import random
+import numpy as np
+from respond import TEMPLATE_BANK
 
 
 class Harness:
@@ -48,3 +51,39 @@ class Harness:
         import numpy as np
         np.savez(filename, **self.activations)
         print(f"Activations saved to '{filename}'")
+
+    def generate_response(self, predicted_digit, confidence, probabilities):
+        # Determine category
+        if confidence >= 0.80:
+            category = "confident"
+        elif confidence >= 0.70:
+            category = "semi_confident"
+        elif confidence >= 0.60:
+            category = "a_little_unsure"
+        elif confidence >= 0.55:
+            category = "unsure"
+        else:
+            category = "no_idea"
+
+        alt_digit = None
+        if category in ("unsure", "a_little_unsure"):
+            if random.random() < 0.5:  # 50% chance to use alt-digit template
+                alt_idx = np.argsort(probabilities)[-2]  # 2nd highest
+                alt_digit = int(alt_idx)
+
+        if category == "a_little_unsure":
+            key = "a_little_unsure_multi" if alt_digit is not None else "a_little_unsure_single"
+        elif category == "unsure":
+            key = "unsure_multi" if alt_digit is not None else "unsure_single"
+        else:
+            key = category
+
+        templates = TEMPLATE_BANK[key]
+
+        template = random.choice(templates)
+
+        response = template.format(
+            digit=predicted_digit,
+            alt_digit=alt_digit if alt_digit is not None else ""
+        )
+        return response

@@ -1,14 +1,14 @@
-import math
 import torch
 from fastapi import FastAPI, File, UploadFile, WebSocket
 import numpy as np
 import cv2
 import uvicorn
-import os
 from scipy.ndimage import center_of_mass
 from net import Net
 from harness import Harness
 from fastapi.middleware.cors import CORSMiddleware
+import base64
+import os
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -35,94 +35,123 @@ model.eval()
 harness = Harness()
 harness.hook(model)
 
+def _file_to_data_url(path: str, mime: str = "image/png") -> str | None:
+    """Read a file and return a data URL, or None if not found."""
+    try:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+    except FileNotFoundError:
+        return None
 
-def preprocess_image(image_path):
-    """Preprocess the image while preserving the digit's structure as closely as possible to MNIST format."""
+import cv2
+import numpy as np
 
-    # 1. Read in grayscale
-    gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if gray is None:
-        raise ValueError("Failed to load the image. Ensure it is a valid image file.")
+def preprocess_image(image_path: str) -> np.ndarray:
+    """
+    White-on-black MNIST-style 28x28, float32 in [-1, 1].
+    Saves debug_raw_image.png and debug_preprocessed.png
+    """
+    # --- 1) Load ---
+    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError("Failed to read image")
+    cv2.imwrite("debug_raw_image.png", img)
 
-    # Debug: Save raw input
-    raw_image_path = "debug_raw_image.png"
-    cv2.imwrite(raw_image_path, gray)
-    print(f"Raw input image saved at: {raw_image_path}")
+    # --- 2) To grayscale & ensure white on black ---
+    if img.ndim == 3 and img.shape[-1] == 4:
+        rgb = img[..., :3].astype(np.float32)
+        a = (img[..., 3:4].astype(np.float32) / 255.0)
+        rgb = rgb * a  # over black
+        gray = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    elif img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
 
-    # 2. Detect if background is white or black by looking at the average pixel.
-    #    If mean is > 127, we assume a white background and invert to get white digit on black.
+    # If image looks light background, invert so fg is bright on dark
     if np.mean(gray) > 127:
         gray = cv2.bitwise_not(gray)
 
-    # 3. Optional slight blur to reduce noise while leaving strokes relatively intact.
-    #    You can disable this if it hurts your accuracy.
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    # Nearly blank guard
+    if np.max(gray) < 10:
+        out = (np.zeros((28, 28), np.float32) - 1.0)
+        vis = np.clip(((out + 1.0) * 0.5) * 255.0, 0, 255).astype(np.uint8)
+        cv2.imwrite("debug_preprocessed.png", vis)
+        return out
 
-    # 4. Use Otsu’s threshold to robustly binarize without losing thin strokes.
-    #    (You can also try cv2.adaptiveThreshold if Otsu is too aggressive.)
-    _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    # --- 3) Crop to ink via Otsu ---
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    coords = cv2.findNonZero(mask)
+    if coords is None:
+        out = (np.zeros((28, 28), np.float32) - 1.0)
+        vis = np.clip(((out + 1.0) * 0.5) * 255.0, 0, 255).astype(np.uint8)
+        cv2.imwrite("debug_preprocessed.png", vis)
+        return out
 
-    # 5. (Optional) If your strokes are very thin/faint, you can apply a small dilation:
-    # kernel = np.ones((2, 2), np.uint8)
-    # gray = cv2.dilate(gray, kernel, iterations=1)
+    x, y, w, h = cv2.boundingRect(coords)
+    m = 2
+    x0 = max(x - m, 0); y0 = max(y - m, 0)
+    x1 = min(x + w + m, gray.shape[1]); y1 = min(y + h + m, gray.shape[0])
+    cropped = gray[y0:y1, x0:x1]
 
-    # 6. Safe crop: find the bounding box of nonzero pixels and pad slightly so we don't clip strokes.
-    def safe_crop(img):
-        coords = cv2.findNonZero(img)
-        if coords is not None:
-            x, y, w, h = cv2.boundingRect(coords)
-            pad = 4  # Increase or decrease if you find edges being chopped
-            x = max(0, x - pad)
-            y = max(0, y - pad)
-            w = min(img.shape[1] - x, w + pad * 2)
-            h = min(img.shape[0] - y, h + pad * 2)
-            img = img[y:y + h, x:x + w]
-        return img
+    # --- 4) Resize so longest side = 20 ---
+    target_inner = 20
+    hc, wc = cropped.shape
+    scale = target_inner / float(max(hc, wc))
+    new_w = max(1, int(round(wc * scale)))
+    new_h = max(1, int(round(hc * scale)))
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+    resized = cv2.resize(cropped, (new_w, new_h), interpolation=interp)
 
-    gray = safe_crop(gray)
+    # --- 5) Slight thicken to match MNIST stroke feel ---
+    # (Keeps edges anti-aliased; not a hard binarize.)
+    res_u8 = resized.astype(np.uint8)
+    res_u8 = cv2.dilate(res_u8, np.ones((2, 2), np.uint8), iterations=1)
 
-    # Make sure we didn't end up with an empty crop
-    if gray.shape[0] == 0 or gray.shape[1] == 0:
-        raise ValueError("The uploaded image is empty or could not be processed.")
+    # --- 6) Paste on 28x28 and center by COM (binary mask) ---
+    canvas = np.zeros((28, 28), dtype=np.float32)
+    ys = (28 - new_h) // 2
+    xs = (28 - new_w) // 2
+    canvas[ys:ys + new_h, xs:xs + new_w] = res_u8.astype(np.float32)
 
-    # 7. Resize to a max dimension of 20 in whichever is larger (height or width) to mimic MNIST
-    h, w = gray.shape
-    # Keep aspect ratio:
-    if h > w:
-        new_h, new_w = 20, int(20 * (w / h))
-    else:
-        new_w, new_h = 20, int(20 * (h / w))
+    # COM from a thresholded mask to avoid grayscale bias
+    thr = canvas.max() * 0.3  # 30% of local max
+    mass = (canvas > thr).astype(np.float32)
+    if mass.sum() > 1e-5:
+        gy, gx = np.indices(mass.shape, dtype=np.float32)
+        cy = float((gy * mass).sum() / mass.sum())
+        cx = float((gx * mass).sum() / mass.sum())
+        dy = int(round(14 - cy))
+        dx = int(round(14 - cx))
+        M = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
+        canvas = cv2.warpAffine(
+            canvas, M, (28, 28),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0.0  # scalar, not list
+        )
 
-    # Use nearest-neighbor so we don’t blur away thin strokes
-    gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    # --- 7) Gentle blur (MNIST-like softness) ---
+    canvas = cv2.GaussianBlur(canvas, (3, 3), 0)
 
-    # 8. Pad up to 28×28, centered
-    pad_h = (28 - new_h) // 2
-    pad_w = (28 - new_w) // 2
-    gray = np.pad(gray,
-                  ((pad_h, 28 - new_h - pad_h), (pad_w, 28 - new_w - pad_w)),
-                  mode='constant', constant_values=0)
+    # --- 8) Contrast stretch within the ink region, then normalize to [-1,1] ---
+    roi = canvas[canvas > 0]
+    if roi.size > 0:
+        hi = np.percentile(roi, 99.0)  # robust max
+        if hi > 0:
+            canvas = np.clip(canvas * (255.0 / hi), 0, 255)
 
-    # 9. (Optional) Recenter by shifting based on center of mass.
-    cy, cx = center_of_mass(gray)
-    if np.isnan(cy) or np.isnan(cx):
-        raise ValueError("Center of mass calculation resulted in NaN. Check the input image.")
+    canvas = (canvas / 255.0 - 0.5) / 0.5
+    out = canvas.astype(np.float32)
 
-    shift_x = int(np.round(28 / 2 - cx))
-    shift_y = int(np.round(28 / 2 - cy))
-    M = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
-    gray = cv2.warpAffine(gray, M, (28, 28), borderMode=cv2.BORDER_CONSTANT, borderValue=(0,))
+    # DEBUG final visualization
+    vis = np.clip(((out + 1.0) * 0.5) * 255.0, 0, 255).astype(np.uint8)
+    cv2.imwrite("debug_preprocessed.png", vis)
 
-    # 10. Normalize to [-1, 1]
-    gray = gray.astype("float32") / 255.0
-    gray = (gray - 0.5) / 0.5
-
-    # Debug: Save final preprocessed image (converted back to [0..255])
-    debug_image_path = "debug_preprocessed_image_fixed.png"
-    cv2.imwrite(debug_image_path, ((gray * 0.5 + 0.5) * 255).astype("uint8"))
-    print(f"Preprocessed image saved at: {debug_image_path}")
-
-    return gray
+    return out
 
 # Prediction endpoint
 @app.post("/predict")
@@ -157,15 +186,24 @@ async def predict_digit(file: UploadFile = File(...)):
         harness.save_activations()
         print(f"Activations saved to 'activity.npz'")
 
+        gradcam_path = "gradcam_output.png"
         grad_cam(model, preprocessed_image_tensor, predicted_digit, save_path="gradcam_output.png")
+        grad_cam(model, preprocessed_image_tensor, predicted_digit, save_path=gradcam_path)
+        gradcam_data_url = _file_to_data_url(gradcam_path)
 
         # Clean up temporary file
         os.remove(temp_file_path)
 
+        # Generate Natural Language Response
+
+        response = harness.generate_response(predicted_digit, confidence, probabilities)
+
         return {
             "digit": predicted_digit,
             "confidence": confidence,
-            "probabilities": probabilities.tolist()
+            "probabilities": probabilities.tolist(),
+            "response": response,
+            "gradcam_data_url": gradcam_data_url
         }
     except Exception as e:
         return {"error": str(e)}
