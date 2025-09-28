@@ -47,10 +47,15 @@ def _file_to_data_url(path: str, mime: str = "image/png") -> str | None:
 import cv2
 import numpy as np
 
+import cv2
+import numpy as np
+
 def preprocess_image(image_path: str) -> np.ndarray:
     """
     White-on-black MNIST-style 28x28, float32 in [-1, 1].
-    Saves debug_raw_image.png and debug_preprocessed.png
+    Saves:
+      - debug_raw_image.png        (as loaded)
+      - debug_preprocessed.png     (final 28x28 visualization)
     """
     # --- 1) Load ---
     img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
@@ -58,33 +63,33 @@ def preprocess_image(image_path: str) -> np.ndarray:
         raise ValueError("Failed to read image")
     cv2.imwrite("debug_raw_image.png", img)
 
-    # --- 2) To grayscale & ensure white on black ---
+    # --- 2) Grayscale & ensure white-on-black ---
     if img.ndim == 3 and img.shape[-1] == 4:
         rgb = img[..., :3].astype(np.float32)
         a = (img[..., 3:4].astype(np.float32) / 255.0)
-        rgb = rgb * a  # over black
+        rgb = rgb * a
         gray = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY)
     elif img.ndim == 3:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
         gray = img
 
-    # If image looks light background, invert so fg is bright on dark
     if np.mean(gray) > 127:
         gray = cv2.bitwise_not(gray)
 
-    # Nearly blank guard
     if np.max(gray) < 10:
         out = (np.zeros((28, 28), np.float32) - 1.0)
         vis = np.clip(((out + 1.0) * 0.5) * 255.0, 0, 255).astype(np.uint8)
         cv2.imwrite("debug_preprocessed.png", vis)
         return out
 
-    # --- 3) Crop to ink via Otsu ---
+    # --- 3) Mask & bbox (loosened) ---
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-    coords = cv2.findNonZero(mask)
+    mask_for_bbox = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+
+    coords = cv2.findNonZero(mask_for_bbox)
     if coords is None:
         out = (np.zeros((28, 28), np.float32) - 1.0)
         vis = np.clip(((out + 1.0) * 0.5) * 255.0, 0, 255).astype(np.uint8)
@@ -92,66 +97,87 @@ def preprocess_image(image_path: str) -> np.ndarray:
         return out
 
     x, y, w, h = cv2.boundingRect(coords)
-    m = 2
-    x0 = max(x - m, 0); y0 = max(y - m, 0)
-    x1 = min(x + w + m, gray.shape[1]); y1 = min(y + h + m, gray.shape[0])
+    margin = 3
+    x0 = max(x - margin, 0); y0 = max(y - margin, 0)
+    x1 = min(x + w + margin, gray.shape[1]); y1 = min(y + h + margin, gray.shape[0])
     cropped = gray[y0:y1, x0:x1]
 
-    # --- 4) Resize so longest side = 20 ---
+    # --- 4) Resize longest side to 20 ---
     target_inner = 20
     hc, wc = cropped.shape
+    if max(hc, wc) == 0:
+        out = (np.zeros((28, 28), np.float32) - 1.0)
+        vis = np.clip(((out + 1.0) * 0.5) * 255.0, 0, 255).astype(np.uint8)
+        cv2.imwrite("debug_preprocessed.png", vis)
+        return out
+
     scale = target_inner / float(max(hc, wc))
     new_w = max(1, int(round(wc * scale)))
     new_h = max(1, int(round(hc * scale)))
-    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
     resized = cv2.resize(cropped, (new_w, new_h), interpolation=interp)
 
-    # --- 5) Slight thicken to match MNIST stroke feel ---
-    # (Keeps edges anti-aliased; not a hard binarize.)
+    # --- 5) Gentle thicken ---
     res_u8 = resized.astype(np.uint8)
-    res_u8 = cv2.dilate(res_u8, np.ones((2, 2), np.uint8), iterations=1)
+    res_u8 = cv2.dilate(res_u8, np.ones((1, 1), np.uint8), iterations=1)
 
-    # --- 6) Paste on 28x28 and center by COM (binary mask) ---
-    canvas = np.zeros((28, 28), dtype=np.float32)
+    # --- 6) Paste, pad, COM-center, crop back ---
+    base = np.zeros((28, 28), dtype=np.float32)
     ys = (28 - new_h) // 2
     xs = (28 - new_w) // 2
-    canvas[ys:ys + new_h, xs:xs + new_w] = res_u8.astype(np.float32)
+    base[ys:ys + new_h, xs:xs + new_w] = res_u8.astype(np.float32)
 
-    # COM from a thresholded mask to avoid grayscale bias
-    thr = canvas.max() * 0.3  # 30% of local max
-    mass = (canvas > thr).astype(np.float32)
-    if mass.sum() > 1e-5:
+    pad = 5  # safe border for shifting
+    padded = cv2.copyMakeBorder(
+        base, pad, pad, pad, pad,
+        borderType=cv2.BORDER_CONSTANT,
+        value=(0.0,)   # <- Sequence[float] to satisfy stubs
+    )
+
+    thr = float(padded.max()) * 0.3
+    mass = (padded > thr).astype(np.float32)
+    if float(mass.sum()) > 1e-5:
         gy, gx = np.indices(mass.shape, dtype=np.float32)
         cy = float((gy * mass).sum() / mass.sum())
         cx = float((gx * mass).sum() / mass.sum())
-        dy = int(round(14 - cy))
-        dx = int(round(14 - cx))
+        dy = int(round((pad + 14) - cy))
+        dx = int(round((pad + 14) - cx))
         M = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
-        canvas = cv2.warpAffine(
-            canvas, M, (28, 28),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0.0  # scalar, not list
+
+        padded = cv2.warpAffine(
+            padded, M,
+            [int(padded.shape[1]), int(padded.shape[0])],  # <- Sequence[int]
+            flags=int(cv2.INTER_LINEAR),
+            borderMode=int(cv2.BORDER_CONSTANT),
+            borderValue=(0.0,)  # <- Sequence[float]
         )
 
-    # --- 7) Gentle blur (MNIST-like softness) ---
-    canvas = cv2.GaussianBlur(canvas, (3, 3), 0)
+    h_pad, w_pad = padded.shape
+    y0 = (h_pad - 28) // 2
+    x0 = (w_pad - 28) // 2
+    canvas = padded[y0:y0+28, x0:x0+28]
 
-    # --- 8) Contrast stretch within the ink region, then normalize to [-1,1] ---
+    # --- 7) Supersample smoothing ---
+    up = cv2.resize(canvas, (56, 56), interpolation=cv2.INTER_CUBIC)
+    up = cv2.GaussianBlur(up, (5, 5), 0.8)
+    canvas = cv2.resize(up, (28, 28), interpolation=cv2.INTER_AREA)
+
+    # --- 8) Contrast stretch in-ink, then normalize to [-1,1] ---
     roi = canvas[canvas > 0]
     if roi.size > 0:
-        hi = np.percentile(roi, 99.0)  # robust max
+        hi = float(np.percentile(roi, 99.0))
         if hi > 0:
             canvas = np.clip(canvas * (255.0 / hi), 0, 255)
 
     canvas = (canvas / 255.0 - 0.5) / 0.5
     out = canvas.astype(np.float32)
 
-    # DEBUG final visualization
+    # --- Debug visualization ---
     vis = np.clip(((out + 1.0) * 0.5) * 255.0, 0, 255).astype(np.uint8)
     cv2.imwrite("debug_preprocessed.png", vis)
 
     return out
+
 
 # Prediction endpoint
 @app.post("/predict")
